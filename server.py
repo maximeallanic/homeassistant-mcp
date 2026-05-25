@@ -450,6 +450,8 @@ class HomeAssistantClient:
     async def create_automation(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new automation via REST API.
         config must include an 'id' field used as the automation identifier."""
+        if isinstance(config, str):
+            config = json.loads(config)
         automation_id = config.get("id")
         if not automation_id:
             automation_id = f"auto_{uuid.uuid4().hex[:8]}"
@@ -459,6 +461,8 @@ class HomeAssistantClient:
 
     async def update_automation(self, automation_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
         """Update an existing automation via REST API"""
+        if isinstance(config, str):
+            config = json.loads(config)
         endpoint = f"/api/config/automation/config/{automation_id}"
         return await self._request("POST", endpoint, json=config)
 
@@ -2529,11 +2533,15 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
                 
             elif name == "create_automation":
                 config = arguments["config"]
+                if isinstance(config, str):
+                    config = json.loads(config)
                 result = await client.create_automation(config)
                 
             elif name == "update_automation":
                 automation_id = arguments["automation_id"]
                 config = arguments["config"]
+                if isinstance(config, str):
+                    config = json.loads(config)
                 result = await client.update_automation(automation_id, config)
                 
             elif name == "delete_automation":
