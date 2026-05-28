@@ -1,353 +1,332 @@
 # Home Assistant MCP Server
 
-A comprehensive [Model Context Protocol (MCP)](https://modelcontextprotocol.io/) server for Home Assistant. Gives Claude agents (and any MCP-compatible AI client) full programmatic access to your Home Assistant instance via REST API and WebSocket — 70+ tools across entity management, automations, scripts, scenes, Lovelace dashboards, HACS, Fully Kiosk tablets, and more.
+A comprehensive Model Context Protocol (MCP) server for integrating with Home Assistant. This server provides **60 tools** and resources to interact with your Home Assistant instance via the REST API, enabling full smart home management and automation.
 
-## Features
+## 🚀 Features Overview
 
-- **REST + WebSocket** — entity states, services, history, logbook, configs, entity registry, device registry
-- **Automation & Script management** — full CRUD (create, read, update, delete, trigger, trace)
-- **Lovelace dashboards** — list, get, create, update, delete dashboards; list cards and resources
-- **HACS** — status, list/install/remove/refresh repositories, get releases
-- **Fully Kiosk Browser tablets** — load URL, screenshot, screen on/off, restart, set config
-- **Camera** — get images (auto-resized, base64 JPEG, Pillow-optimized)
-- **Real-time events** — SSE-based event subscriptions with entity/domain filtering
-- **System management** — restart/stop HA, validate config, system health, supervisor info
-- **Integration management** — list, enable, disable, delete, reload integrations; run config flows
+**60 Total Tools** across **9 Major Categories** for comprehensive Home Assistant management:
 
-## Requirements
+### 🔧 **Core Operations** (13 tools)
+- **Entity State Management**: Get, set, update, and delete entity states
+- **Service Calls**: Execute Home Assistant services with full response support
+- **Entity Search**: Advanced search with filtering by name, domain, or state
+- **Event Handling**: Fire custom events with data payloads
+- **Template Rendering**: Render Home Assistant templates with live data
 
-- Python 3.11+
-- Home Assistant instance (local or remote, HTTP or HTTPS)
-- A Home Assistant [long-lived access token](https://developers.home-assistant.io/docs/auth_api/#long-lived-access-token)
+### 🏠 **Area & Device Management** (8 tools)
+- **Area Management**: Create, update, delete areas/zones with aliases
+- **Device Registry**: List, configure, and manage all Home Assistant devices
+- **Entity Organization**: Assign entities to areas, bulk area operations
+- **Device Assignment**: Move devices between areas, enable/disable devices
+
+### 🖥️ **System Management** (6 tools)
+- **System Control**: Restart/stop Home Assistant safely
+- **Health Monitoring**: Check system health and component status
+- **Configuration Validation**: Validate configs before applying changes
+- **Supervisor Integration**: Get supervisor info (Home Assistant OS)
+
+### 🔌 **Integration Management** (6 tools)
+- **Integration Lifecycle**: List, enable, disable, delete integrations
+- **Integration Troubleshooting**: Reload integrations, get detailed info
+- **Dynamic Management**: Programmatically manage integration configurations
+
+### 🔔 **Notification Services** (3 tools)
+- **Multi-Channel Notifications**: Send via mobile apps, persistent notifications
+- **Service Discovery**: List all available notification services
+- **Notification Management**: Dismiss persistent notifications
+
+### 📋 **Entity Registry Management** (4 tools)
+- **Entity Configuration**: Update entity names, areas, enabled/disabled status
+- **Bulk Operations**: Enable/disable multiple entities
+- **Registry Information**: Get detailed entity registry data
+
+### 🤖 **Automation & Scene Management** (12 tools)
+- **Automation Control**: Create, update, delete, trigger automations
+- **Scene Management**: Activate scenes, create new scenes from current states
+- **Automation Debugging**: Get execution traces and troubleshooting data
+- **Lifecycle Management**: Full CRUD operations for automations
+
+### 📊 **Data & History** (4 tools)
+- **Historical Data**: Advanced history queries with filtering options
+- **Logbook Access**: Get event history and entity changes
+- **Error Logs**: Retrieve Home Assistant error logs for debugging
+
+### 🎥 **Calendar & Media** (4 tools)
+- **Calendar Integration**: List calendars and get events with date ranges
+- **Camera Support**: Get images from camera entities (base64 encoded)
+- **Intent Processing**: Handle Home Assistant voice/text intents
+- **Real-time Events**: Subscribe to live Home Assistant events via SSE
 
 ## Installation
 
+1. Clone this repository:
 ```bash
-git clone https://github.com/maximeallanic/homeassistant-mcp.git
+git clone https://github.com/cronus42/homeassistant-mcp.git
 cd homeassistant-mcp
+```
+
+2. Run the setup script:
+```bash
 ./setup.sh
 ```
 
-`setup.sh` creates a `venv/` virtual environment and installs dependencies from `requirements.txt`.
+3. Get your Home Assistant Long-Lived Access Token:
+   - Log into your Home Assistant web interface
+   - Go to Profile (click on your user name in bottom left)
+   - Scroll down to "Long-lived access tokens"
+   - Click "Create Token"
+   - Give it a name (e.g., "MCP Server")
+   - Copy the token
 
-## Configuration
-
+4. Configure your settings:
 ```bash
 cp .env.example .env
+# Edit .env with your Home Assistant URL and token
 ```
 
-Edit `.env`:
-
-```env
-HA_URL=http://homeassistant.local:8123   # or https://your-ha-domain.com
-HA_TOKEN=your_long_lived_access_token_here
+5. Test the connection:
+```bash
+python tests/test_connection.py
 ```
 
-**How to get a token:** Home Assistant → Profile → Long-Lived Access Tokens → Create Token.
+## Usage with MCP Clients
 
-## Usage
+### Warp Terminal Integration
 
-### Start the server
+1. Run the setup script:
+```bash
+./setup.sh
+```
 
+2. Configure Warp to use the MCP server:
+```bash
+warp mcp add-server --config mcp_config.json
+```
+
+Or manually start the server:
 ```bash
 ./start_server.sh
 ```
 
-Or directly:
+### Claude Desktop Configuration
 
-```bash
-export HA_URL=http://homeassistant.local:8123
-export HA_TOKEN=your_token
-python server.py
-```
-
-### Claude Desktop
-
-Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS):
+Add to your Claude Desktop config file (`~/Library/Application Support/Claude/claude_desktop_config.json` on macOS):
 
 ```json
 {
   "mcpServers": {
     "homeassistant": {
-      "command": "/path/to/homeassistant-mcp/start_server.sh"
+      "command": "/path/to/homeassistant-mcp/start_server.sh",
+      "env": {},
+      "args": []
     }
   }
 }
 ```
 
-### Personas Studio (Claude Agent SDK)
+## Available Tools
 
-Register in your agent's MCP list using `start_mcp.sh` (loads credentials from `.env` and activates the `.venv`):
-
+### `get_entity_state`
+Get the current state of a specific Home Assistant entity.
 ```json
 {
-  "name": "ha-history",
-  "command": "/path/to/homeassistant-mcp/start_mcp.sh",
-  "args": []
+  "entity_id": "light.living_room"
 }
 ```
 
-The MCP is used internally by the `home-manager` agent with tools prefixed `mcp__ha-history__*`.
+### `call_service`
+Call a Home Assistant service to control devices.
+```json
+{
+  "domain": "light",
+  "service": "turn_on",
+  "entity_id": "light.living_room",
+  "service_data": {
+    "brightness": 255,
+    "color_temp": 3000
+  }
+}
+```
 
-## Available Tools
+### `search_entities`
+Search for entities by name, domain, or state.
+```json
+{
+  "query": "temperature",
+  "domain": "sensor"
+}
+```
 
-### Entity State Management
+### `fire_event`
+Fire a custom event in Home Assistant.
+```json
+{
+  "event_type": "custom_automation_trigger",
+  "event_data": {
+    "source": "mcp_server",
+    "action": "test"
+  }
+}
+```
 
-| Tool | Description |
-|------|-------------|
-| `get_entity_state` | Get current state of an entity |
-| `search_entities` | Search entities by name, domain, or state |
-| `set_state` | Set/update entity state (virtual state, not device control) |
-| `delete_state` | Delete an entity state |
-| `get_entity_registry` | Get full entity registry |
-| `update_entity_registry` | Update entity name, area, enabled/disabled |
-| `enable_entity` / `disable_entity` | Enable or disable an entity |
-| `get_area_entities` | Get entities in a given area |
+### `get_history`
+Get historical data for specific entities.
+```json
+{
+  "entity_ids": ["sensor.temperature", "light.living_room"],
+  "start_time": "2024-01-01T00:00:00Z"
+}
+```
 
-### Service Calls
+### New Feature Examples
 
-| Tool | Description |
-|------|-------------|
-| `call_service` | Call any HA service (`domain`, `service`, `entity_id`, `service_data`) |
-| `call_service_with_response` | Call service and return response data (e.g. weather forecasts) |
-| `fire_event` | Fire a custom HA event |
-| `handle_intent` | Handle a HA intent (SetTimer, GetWeather, etc.) |
-| `render_template` | Render a Jinja2 template |
+#### Area Management
+```json
+{
+  "tool": "get_areas",
+  "arguments": {}
+}
+```
 
-### Automations
+#### Create and Manage Areas
+```json
+{
+  "tool": "create_area",
+  "arguments": {
+    "name": "Home Office",
+    "aliases": ["office", "workspace"]
+  }
+}
+```
 
-| Tool | Description |
-|------|-------------|
-| `get_automations` | List all automations |
-| `get_automation` | Get automation details |
-| `create_automation` | Create automation from config |
-| `update_automation` | Update existing automation |
-| `delete_automation` | Delete automation |
-| `toggle_automation` / `turn_on_automation` / `turn_off_automation` | Control automation state |
-| `trigger_automation` | Manually trigger an automation |
-| `reload_automations` | Reload automations from config |
-| `get_automation_trace` | Get execution trace for debugging |
+#### Device Management
+```json
+{
+  "tool": "get_devices",
+  "arguments": {}
+}
+```
 
-### Scripts
+#### System Health Check
+```json
+{
+  "tool": "get_system_health",
+  "arguments": {}
+}
+```
 
-| Tool | Description |
-|------|-------------|
-| `list_scripts` | List all scripts |
-| `create_script` | Create a new script |
-| `update_script` | Update an existing script |
-| `delete_script` | Delete a script |
-| `reload_scripts` | Reload all scripts |
+#### Send Notifications
+```json
+{
+  "tool": "send_notification",
+  "arguments": {
+    "message": "Security Alert: Front door opened",
+    "title": "Security System",
+    "target": "mobile_app_phone"
+  }
+}
+```
 
-### Scenes
+#### Integration Management
+```json
+{
+  "tool": "get_integrations",
+  "arguments": {}
+}
+```
 
-| Tool | Description |
-|------|-------------|
-| `get_scenes` | List all scenes |
-| `activate_scene` | Activate a scene |
-| `create_scene` | Create scene from current entity states |
+## Testing
 
-### Areas & Devices
+The server includes comprehensive test suites:
 
-| Tool | Description |
-|------|-------------|
-| `get_areas` | List all areas |
-| `create_area` / `update_area` / `delete_area` | Manage areas |
-| `get_entities_by_area` | Get entities in an area |
-| `get_devices` | List all devices |
-| `get_device` | Get device details |
-| `update_device` | Rename device or assign to area |
+### Run All Tests
+```bash
+# Test tool definitions and schemas
+python tests/test_mcp_tools.py
 
-### Lovelace Dashboards
+# Test tool handlers with mocking
+python tests/test_tool_handlers.py
 
-| Tool | Description |
-|------|-------------|
-| `list_dashboards` | List all dashboards |
-| `get_dashboard_config` | Get full dashboard YAML config |
-| `update_dashboard_config` | Save dashboard config |
-| `create_dashboard` | Create new dashboard |
-| `delete_dashboard` | Delete a dashboard |
-| `list_lovelace_resources` | List registered JS resources |
-| `list_lovelace_cards` | List all available card types (built-in + HACS) |
+# Test with real Home Assistant (requires HA_TOKEN)
+python tests/test_new_features.py
 
-### HACS
+# Test basic connection
+python tests/test_connection.py
+```
 
-| Tool | Description |
-|------|-------------|
-| `hacs_status` | Get HACS status |
-| `hacs_list_repositories` | List repos (filter by category) |
-| `hacs_repository_info` | Get repo details |
-| `hacs_download` | Install/update a repo |
-| `hacs_remove` | Uninstall a repo |
-| `hacs_refresh` | Refresh repo metadata |
-| `hacs_releases` | List available versions |
+### Test Results
+- ✅ **60/60 tools** properly defined
+- ✅ **All schemas** validated
+- ✅ **All tool handlers** working correctly
+- ✅ **100% test coverage** for new features
 
-### System & Integrations
+## Available Resources
 
-| Tool | Description |
-|------|-------------|
-| `get_system_health` | System health status |
-| `get_system_info` | Host/OS info |
-| `get_supervisor_info` | Supervisor info (HA OS only) |
-| `check_config` / `check_config_valid` | Validate HA configuration |
-| `restart_homeassistant` | Graceful HA restart |
-| `stop_homeassistant` | Stop HA |
-| `get_integrations` / `list_config_entries` | List integrations |
-| `reload_integration` | Reload an integration |
-| `enable_integration` / `disable_integration` / `delete_integration` | Manage integrations |
-| `start_integration_flow` / `get_integration_flow` / `submit_integration_flow` | Run config flows |
-| `get_integration_info` | Get integration details |
-
-### Notifications
-
-| Tool | Description |
-|------|-------------|
-| `send_notification` | Send via any notify service or persistent notification |
-| `get_notification_services` | List available notification targets |
-| `dismiss_notification` | Dismiss a persistent notification |
-
-### Data & History
-
-| Tool | Description |
-|------|-------------|
-| `get_history` | Historical entity states with filtering |
-| `get_logbook` | Logbook events |
-| `get_error_log` | HA error log |
-| `get_calendars` | List calendar entities |
-| `get_calendar_events` | Get events from a calendar |
-| `get_camera_image` | Get camera snapshot (resized JPEG, base64) |
-
-### Real-time Events
-
-| Tool | Description |
-|------|-------------|
-| `subscribe_events` | Subscribe to HA events via SSE (filter by type/entity/domain) |
-| `get_sse_stats` | Get current SSE subscription stats |
-
-### WebSocket & Kiosk
-
-| Tool | Description |
-|------|-------------|
-| `websocket_call` | Generic WebSocket command (entity icons, subscribe_trigger, etc.) |
-| `fully_kiosk_command` | Control Fully Kiosk Browser tablets (load_url, screenshot, screen_on/off, restart) |
-
-## MCP Resources
-
-The server also exposes MCP resources readable by the client:
-
-- `homeassistant://states` — all entity states
-- `homeassistant://config` — HA system configuration
-- `homeassistant://services` — all available services
-- `homeassistant://events` — available event types
+- `homeassistant://states` - Current state of all entities
+- `homeassistant://config` - Home Assistant configuration
+- `homeassistant://services` - Available services
+- `homeassistant://events` - Available event types
 
 ## Usage Examples
 
 ### Turn on a light
-
 ```json
 {
   "tool": "call_service",
   "arguments": {
     "domain": "light",
     "service": "turn_on",
-    "entity_id": "light.living_room",
-    "service_data": { "brightness": 200, "color_temp": 3000 }
+    "entity_id": "light.living_room"
   }
 }
 ```
 
-### Get temperature sensor history
-
+### Check temperature sensors
 ```json
 {
-  "tool": "get_history",
+  "tool": "search_entities",
   "arguments": {
-    "entity_ids": ["sensor.living_room_temperature"],
-    "start_time": "2024-01-01T00:00:00Z",
-    "minimal_response": true
+    "query": "temperature",
+    "domain": "sensor"
   }
 }
 ```
 
-### Send a mobile notification
-
+### Get current state of all lights
 ```json
 {
-  "tool": "send_notification",
+  "tool": "search_entities",
   "arguments": {
-    "message": "Front door opened",
-    "title": "Security Alert",
-    "target": "mobile_app_myphone"
+    "query": "light",
+    "domain": "light"
   }
 }
-```
-
-### Control a Fully Kiosk tablet
-
-```json
-{
-  "tool": "fully_kiosk_command",
-  "arguments": {
-    "device_id": "9bdddc78adfa5d4fd74b98b735dc112f",
-    "command": "load_url",
-    "url": "http://homeassistant.local:8123/dashboard-kiosk/default"
-  }
-}
-```
-
-### Generic WebSocket command (set entity icon)
-
-```json
-{
-  "tool": "websocket_call",
-  "arguments": {
-    "type": "entity_registry/update",
-    "data": {
-      "entity_id": "light.living_room",
-      "icon": "mdi:ceiling-light"
-    }
-  }
-}
-```
-
-## Testing
-
-```bash
-# Basic connectivity test (requires HA_TOKEN)
-python tests/test_connection.py
-
-# Tool schema validation (no HA connection needed)
-python tests/test_mcp_tools.py
-
-# Tool handler tests with mocks (no HA connection needed)
-python tests/test_tool_handlers.py
-
-# Live integration tests (requires HA_TOKEN)
-python tests/test_new_features.py
 ```
 
 ## Security
 
-- Never commit your `.env` file (it is in `.gitignore`)
-- Use a dedicated long-lived access token with minimal required permissions
-- If exposing HA externally, use HTTPS and ensure your token is kept secret
-- Prefer internal network access (`http://homeassistant.local:8123`) over external URLs when possible
+- Store your Home Assistant token securely
+- Use environment variables for configuration
+- Consider network security between your MCP client and Home Assistant
+- Limit token permissions if possible
 
-## Architecture
+## Troubleshooting
 
-```
-server.py                    # Main MCP server (70+ tools, REST + WebSocket)
-  HomeAssistantClient        # Async HTTP + WebSocket client
-  SSEManager                 # Real-time event subscription manager
-  MCP tool handlers          # One handler per tool, all async
+### Connection Issues
+- Verify Home Assistant URL is accessible
+- Check if Home Assistant API is enabled
+- Ensure token is valid and has proper permissions
 
-start_mcp.sh                 # Entry point for Personas Studio (uses .venv)
-start_server.sh              # Entry point for other clients (uses venv/)
-setup.sh                     # One-time setup (creates venv, installs deps)
-mcp_config.json              # MCP server config for Warp terminal
-requirements.txt             # Python dependencies (aiohttp, mcp, Pillow)
-tests/                       # Test suite (connection, schemas, handlers, integration)
-```
+### Authentication Errors
+- Regenerate long-lived access token
+- Check token format (should be a long string)
+- Verify token is set in environment variable
 
-## License
+### Service Call Failures
+- Check entity IDs exist in Home Assistant
+- Verify service names and parameters
+- Check Home Assistant logs for errors
 
-MIT — see [LICENSE](LICENSE)
+## Contributing
+
+Feel free to submit issues and enhancement requests!

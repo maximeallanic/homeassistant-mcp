@@ -36,6 +36,41 @@ from mcp.types import (
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("homeassistant-mcp")
 
+def _paginate(
+    items: list,
+    search: Optional[str] = None,
+    search_keys: Optional[List[str]] = None,
+    domain: Optional[str] = None,
+    offset: int = 0,
+    limit: int = 0,
+) -> Dict[str, Any]:
+    """Apply search filter and pagination to a list of dicts.
+
+    Returns {"items": [...], "total": N, "offset": M, "limit": L}.
+    """
+    if domain:
+        items = [
+            i for i in items
+            if (i.get("entity_id", "") or "").startswith(f"{domain}.")
+            or i.get("domain") == domain
+        ]
+    if search:
+        q = search.lower()
+        if search_keys:
+            items = [
+                i for i in items
+                if any(q in str(i.get(k, "")).lower() for k in search_keys)
+            ]
+        else:
+            items = [i for i in items if q in str(i).lower()]
+    total = len(items)
+    if offset > 0:
+        items = items[offset:]
+    if limit > 0:
+        items = items[:limit]
+    return {"items": items, "total": total, "offset": offset, "limit": limit}
+
+
 class HomeAssistantClient:
     """Home Assistant API client with REST and WebSocket support"""
 
@@ -251,19 +286,26 @@ class HomeAssistantClient:
     async def hacs_releases(self, repository_id: str) -> Any:
         return await self.ws_command("hacs/repository/releases", {"repository_id": repository_id})
 
-    async def _request(self, method: str, endpoint: str, **kwargs) -> Dict[str, Any]:
-        """Make HTTP request to Home Assistant API"""
+    async def _request(self, method: str, endpoint: str, **kwargs) -> Any:
+        """Make HTTP request to Home Assistant API.
+
+        Automatically returns JSON or plain text based on response Content-Type.
+        """
         if not self.session:
             raise RuntimeError("Client not initialized. Use async context manager.")
-        
+
         url = urljoin(self.base_url, endpoint)
-        
+
         try:
             async with self.session.request(
                 method, url, headers=self.headers, **kwargs
             ) as response:
                 response.raise_for_status()
-                return await response.json()
+                ct = response.content_type or ""
+                if "json" in ct:
+                    return await response.json()
+                # /api/template and other endpoints return text/plain
+                return await response.text()
         except aiohttp.ClientError as e:
             logger.error(f"HTTP request failed: {e}")
             raise
@@ -363,7 +405,18 @@ class HomeAssistantClient:
         # This returns binary data, so we need special handling
         if not self.session:
             raise RuntimeError("Client not initialized. Use async context manager.")
-        
+
+        url = urljoin(self.base_url, endpoint)
+        async with self.session.get(url, headers=self.headers) as response:
+            response.raise_for_status()
+            return await response.read()
+
+    async def get_image_proxy(self, image_entity_id: str) -> bytes:
+        """Get image entity data (for image.* entities)"""
+        endpoint = f"/api/image_proxy/{image_entity_id}"
+        if not self.session:
+            raise RuntimeError("Client not initialized. Use async context manager.")
+
         url = urljoin(self.base_url, endpoint)
         async with self.session.get(url, headers=self.headers) as response:
             response.raise_for_status()
@@ -417,15 +470,140 @@ class HomeAssistantClient:
         
         return await self.session.get(url, headers=headers)
 
-    async def get_automations(self) -> List[Dict[str, Any]]:
-        """Get all automations"""
-        states = await self._request("GET", "/api/states")
-        automations = [state for state in states if state["entity_id"].startswith("automation.")]
-        return automations
+    async def get_automations(
+        self,
+        include_disabled: bool = True,
+        compact: bool = False,
+        search: Optional[str] = None,
+        state_filter: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 0,
+    ) -> Dict[str, Any]:
+        """Get automations via entity registry (lightweight) with filtering and pagination.
+
+        Returns {"items": [...], "total": N, "offset": M, "limit": L}.
+        """
+        automations: List[Dict[str, Any]] = []
+
+        try:
+            registry = await self._ws_send_command({"type": "config/entity_registry/list"})
+            auto_entries = [e for e in registry if e.get("entity_id", "").startswith("automation.")]
+
+            for entry in auto_entries:
+                is_disabled = bool(entry.get("disabled_by"))
+                if is_disabled and not include_disabled:
+                    continue
+
+                if compact:
+                    automations.append({
+                        "entity_id": entry["entity_id"],
+                        "friendly_name": entry.get("original_name") or entry.get("name", ""),
+                        "unique_id": entry.get("unique_id"),
+                        "disabled_by": entry.get("disabled_by"),
+                    })
+                else:
+                    if not is_disabled:
+                        try:
+                            state = await self._request("GET", f"/api/states/{entry['entity_id']}")
+                            automations.append(state)
+                            continue
+                        except Exception:
+                            pass
+                    automations.append({
+                        "entity_id": entry["entity_id"],
+                        "state": "disabled" if is_disabled else "unknown",
+                        "attributes": {
+                            "id": entry.get("unique_id"),
+                            "friendly_name": entry.get("original_name") or entry.get("name", ""),
+                            "icon": entry.get("icon"),
+                            "disabled_by": entry.get("disabled_by"),
+                        },
+                    })
+
+        except Exception as e:
+            logger.warning(f"WebSocket entity_registry failed, falling back to /api/states: {e}")
+            states = await self._request("GET", "/api/states")
+            automations = [s for s in states if s["entity_id"].startswith("automation.")]
+
+        # State filter (specific to automations)
+        if state_filter:
+            sf = state_filter.lower()
+            automations = [a for a in automations if a.get("state", "").lower() == sf]
+
+        return _paginate(automations, search=search,
+                         search_keys=["entity_id", "friendly_name"],
+                         offset=offset, limit=limit)
+
+    async def get_automation_configs(
+        self,
+        search: Optional[str] = None,
+        offset: int = 0,
+        limit: int = 0,
+    ) -> Dict[str, Any]:
+        """List UI-managed automation configs with filtering and pagination.
+
+        Returns {"items": [...], "total": N, "offset": M, "limit": L}.
+        """
+        try:
+            configs = await self._ws_send_command({"type": "automation/config", "id_list": True})
+            if isinstance(configs, list):
+                for c in configs:
+                    if isinstance(c, dict) and "_automation_id" not in c:
+                        c["_config_available"] = True
+                return _paginate(configs, search=search, offset=offset, limit=limit)
+        except Exception:
+            pass
+
+        # Fallback: iterate known automation IDs from the registry
+        results: List[Dict[str, Any]] = []
+        inventory = await self.get_automations(compact=True)
+        for auto in inventory["items"]:
+            uid = auto.get("unique_id")
+            if not uid:
+                continue
+            try:
+                config = await self._request("GET", f"/api/config/automation/config/{uid}")
+                if isinstance(config, dict):
+                    config["_automation_id"] = uid
+                    config["_entity_id"] = auto.get("entity_id")
+                    config["_config_available"] = True
+                    results.append(config)
+            except Exception:
+                results.append({
+                    "_automation_id": uid,
+                    "_entity_id": auto.get("entity_id"),
+                    "_config_available": False,
+                    "_note": "YAML-only automation — config not accessible via API",
+                })
+
+        return _paginate(results, search=search, offset=offset, limit=limit)
     
     async def get_automation(self, automation_id: str) -> Dict[str, Any]:
-        """Get specific automation details"""
-        return await self._request("GET", f"/api/states/{automation_id}")
+        """Get specific automation details including full config (triggers, conditions, actions)"""
+        state = await self._request("GET", f"/api/states/{automation_id}")
+        # The config endpoint uses the internal id (from attributes), not the entity_id suffix
+        internal_id = state.get("attributes", {}).get("id")
+        if internal_id:
+            try:
+                config = await self._request("GET", f"/api/config/automation/config/{internal_id}")
+                state["config"] = config
+                state["config_available"] = True
+            except Exception:
+                # Config endpoint fails for YAML-only automations
+                state["config_available"] = False
+                state["config_note"] = (
+                    "Full automation config unavailable via API. "
+                    "This automation is likely defined in automations.yaml (not via UI). "
+                    "Only partial state attributes are available. "
+                    "To see the full YAML, read the automations.yaml file directly on the HA host."
+                )
+        else:
+            state["config_available"] = False
+            state["config_note"] = (
+                "No internal automation ID found in attributes. "
+                "Cannot fetch full config from the API."
+            )
+        return state
     
     async def toggle_automation(self, automation_id: str) -> List[Dict[str, Any]]:
         """Toggle an automation on/off"""
@@ -447,22 +625,95 @@ class HomeAssistantClient:
         """Reload all automations"""
         return await self.call_service("automation", "reload")
     
+    @staticmethod
+    def _normalize_automation_keys(config: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize singular to plural keys for HA 2026.x format."""
+        for key in ('trigger', 'action', 'condition'):
+            if key in config and f'{key}s' not in config:
+                config[f'{key}s'] = config.pop(key)
+        return config
+
     async def create_automation(self, config: Dict[str, Any]) -> Dict[str, Any]:
         """Create a new automation via REST API.
+        Checks for duplicates by ID and alias before creating.
+        Also checks disabled automations in the entity registry to prevent
+        creating a duplicate that would conflict with a disabled entry.
         config must include an 'id' field used as the automation identifier."""
-        if isinstance(config, str):
-            config = json.loads(config)
         automation_id = config.get("id")
+        alias = config.get("alias", "")
+
+        # Fetch existing automations (including disabled) to check for duplicates.
+        # get_automations() returns a paginated dict {"items": [...], ...}; the
+        # automation records live under "items". Iterating the dict directly would
+        # yield its string keys and crash with "'str' object has no attribute 'get'".
+        existing = await self.get_automations(include_disabled=True)
+        existing_items = existing.get("items", []) if isinstance(existing, dict) else existing
+
+        # Check by ID — if the automation_id already exists, update instead
+        if automation_id:
+            for auto in existing_items:
+                existing_id = auto.get("attributes", {}).get("id", "")
+                if existing_id == automation_id:
+                    disabled_by = auto.get("attributes", {}).get("disabled_by")
+                    if disabled_by:
+                        logger.warning(
+                            f"Automation '{automation_id}' exists but is disabled "
+                            f"(disabled_by={disabled_by}). Re-enabling and updating."
+                        )
+                        # Re-enable the entity before updating
+                        try:
+                            await self._ws_send_command({
+                                "type": "config/entity_registry/update",
+                                "entity_id": auto["entity_id"],
+                                "disabled_by": None,
+                            })
+                        except Exception as e:
+                            logger.warning(f"Could not re-enable entity: {e}")
+                    else:
+                        logger.info(f"Automation '{automation_id}' already exists, updating instead of creating")
+                    return await self.update_automation(automation_id, config)
+
+        # Check by alias — if an automation with the same name exists, update it
+        if alias:
+            for auto in existing_items:
+                existing_alias = auto.get("attributes", {}).get("friendly_name", "")
+                if existing_alias and existing_alias.strip().lower() == alias.strip().lower():
+                    existing_id = auto.get("attributes", {}).get("id", "")
+                    if existing_id:
+                        disabled_by = auto.get("attributes", {}).get("disabled_by")
+                        if disabled_by:
+                            logger.warning(
+                                f"Automation with alias '{alias}' exists but is disabled. "
+                                f"Re-enabling and updating."
+                            )
+                            try:
+                                await self._ws_send_command({
+                                    "type": "config/entity_registry/update",
+                                    "entity_id": auto["entity_id"],
+                                    "disabled_by": None,
+                                })
+                            except Exception as e:
+                                logger.warning(f"Could not re-enable entity: {e}")
+                        else:
+                            logger.info(f"Automation with alias '{alias}' already exists (id: {existing_id}), updating instead of creating")
+                        config["id"] = existing_id
+                        return await self.update_automation(existing_id, config)
+
+        # No duplicate found — create new
         if not automation_id:
             automation_id = f"auto_{uuid.uuid4().hex[:8]}"
             config["id"] = automation_id
+        self._normalize_automation_keys(config)
         endpoint = f"/api/config/automation/config/{automation_id}"
         return await self._request("POST", endpoint, json=config)
 
     async def update_automation(self, automation_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
-        """Update an existing automation via REST API"""
-        if isinstance(config, str):
-            config = json.loads(config)
+        """Update an existing automation via REST API.
+
+        HA config endpoint uses POST for both create and update — PUT is not
+        supported and silently triggers a reload that overwrites the changes."""
+        self._normalize_automation_keys(config)
+        config["id"] = automation_id
         endpoint = f"/api/config/automation/config/{automation_id}"
         return await self._request("POST", endpoint, json=config)
 
@@ -479,11 +730,11 @@ class HomeAssistantClient:
             endpoint = f"/api/trace/automation/{automation_id}"
         return await self._request("GET", endpoint)
     
-    async def get_scenes(self) -> List[Dict[str, Any]]:
-        """Get all scenes"""
+    async def get_scenes(self, search: Optional[str] = None, offset: int = 0, limit: int = 0) -> Dict[str, Any]:
+        """Get all scenes with optional search and pagination."""
         states = await self._request("GET", "/api/states")
-        scenes = [state for state in states if state["entity_id"].startswith("scene.")]
-        return scenes
+        scenes = [s for s in states if s["entity_id"].startswith("scene.")]
+        return _paginate(scenes, search=search, search_keys=["entity_id"], offset=offset, limit=limit)
     
     async def activate_scene(self, scene_id: str) -> List[Dict[str, Any]]:
         """Activate a scene"""
@@ -547,14 +798,16 @@ class HomeAssistantClient:
         return await self._request("DELETE", f"/api/config/area_registry/{area_id}")
     
     # Device Management
-    async def get_devices(self) -> List[Dict[str, Any]]:
-        """Get all devices"""
-        return await self._request("GET", "/api/config/device_registry")
+    async def get_devices(self, search: Optional[str] = None, offset: int = 0, limit: int = 0) -> Dict[str, Any]:
+        """Get all devices with optional search and pagination."""
+        devices = await self._ws_send_command({"type": "config/device_registry/list"})
+        return _paginate(devices, search=search, search_keys=["name", "name_by_user", "manufacturer", "model"],
+                         offset=offset, limit=limit)
     
     async def get_device(self, device_id: str) -> Dict[str, Any]:
         """Get specific device information"""
-        devices = await self.get_devices()
-        for device in devices:
+        result = await self.get_devices()
+        for device in result["items"]:
             if device.get("id") == device_id:
                 return device
         raise ValueError(f"Device {device_id} not found")
@@ -569,24 +822,23 @@ class HomeAssistantClient:
             data["area_id"] = area_id
         if disabled_by is not None:
             data["disabled_by"] = disabled_by
-        return await self._request("POST", f"/api/config/device_registry/{device_id}", json=data)
+        return await self._ws_send_command({"type": "config/device_registry/update", "device_id": device_id, **data})
     
-    async def get_entities_by_area(self, area_id: str) -> List[Dict[str, Any]]:
-        """Get all entities in a specific area"""
-        entity_registry = await self._request("GET", "/api/config/entity_registry")
-        device_registry = await self.get_devices()
-        
-        # Get devices in the area
-        area_devices = [d["id"] for d in device_registry if d.get("area_id") == area_id]
-        
-        # Get entities from those devices or directly assigned to area
-        area_entities = []
-        for entity in entity_registry:
-            if (entity.get("area_id") == area_id or 
-                entity.get("device_id") in area_devices):
-                area_entities.append(entity)
-        
-        return area_entities
+    async def get_entities_by_area(self, area_id: str, search: Optional[str] = None,
+                                   domain: Optional[str] = None, offset: int = 0, limit: int = 0) -> Dict[str, Any]:
+        """Get all entities in a specific area with optional search/domain filter and pagination."""
+        entity_registry = await self._ws_send_command({"type": "config/entity_registry/list"})
+        device_result = await self.get_devices()
+        all_devices = device_result["items"] if isinstance(device_result, dict) else device_result
+
+        area_devices = {d["id"] for d in all_devices if d.get("area_id") == area_id}
+
+        area_entities = [
+            e for e in entity_registry
+            if e.get("area_id") == area_id or e.get("device_id") in area_devices
+        ]
+        return _paginate(area_entities, search=search, search_keys=["entity_id", "original_name", "name"],
+                         domain=domain, offset=offset, limit=limit)
     
     # System Management
     async def restart_homeassistant(self) -> Dict[str, Any]:
@@ -630,9 +882,12 @@ class HomeAssistantClient:
             }
     
     # Integration Management  
-    async def get_integrations(self) -> List[Dict[str, Any]]:
-        """Get all configured integrations"""
-        return await self.ws_command("config_entries/get")
+    async def get_integrations(self, search: Optional[str] = None, domain: Optional[str] = None,
+                               offset: int = 0, limit: int = 0) -> Dict[str, Any]:
+        """Get all configured integrations with optional search/domain filter and pagination."""
+        entries = await self.ws_command("config_entries/get")
+        return _paginate(entries, search=search, search_keys=["title", "domain"],
+                         domain=domain, offset=offset, limit=limit)
     
     async def reload_integration(self, integration_domain: str) -> Dict[str, Any]:
         """Reload a specific integration"""
@@ -652,18 +907,16 @@ class HomeAssistantClient:
     
     async def get_integration_info(self, config_entry_id: str) -> Dict[str, Any]:
         """Get information about a specific integration"""
-        integrations = await self.get_integrations()
-        for integration in integrations:
+        result = await self.get_integrations()
+        for integration in result["items"]:
             if integration.get("entry_id") == config_entry_id:
                 return integration
         raise ValueError(f"Integration {config_entry_id} not found")
 
     async def list_config_entries(self, domain: Optional[str] = None) -> List[Dict[str, Any]]:
         """List config entries, optionally filtered by domain"""
-        entries = await self.get_integrations()
-        if domain:
-            entries = [e for e in entries if e.get("domain") == domain]
-        return entries
+        result = await self.get_integrations(domain=domain)
+        return result["items"]
 
     async def start_integration_flow(self, handler: str) -> Dict[str, Any]:
         """Initiate a config flow for a given integration domain"""
@@ -711,9 +964,12 @@ class HomeAssistantClient:
                                      {"notification_id": notification_id})
     
     # Entity Registry Management
-    async def get_entity_registry(self) -> List[Dict[str, Any]]:
-        """Get entity registry information"""
-        return await self._request("GET", "/api/config/entity_registry")
+    async def get_entity_registry(self, search: Optional[str] = None, domain: Optional[str] = None,
+                                  offset: int = 0, limit: int = 0) -> Dict[str, Any]:
+        """Get entity registry with optional search/domain filter and pagination."""
+        entities = await self._ws_send_command({"type": "config/entity_registry/list"})
+        return _paginate(entities, search=search, search_keys=["entity_id", "original_name", "name"],
+                         domain=domain, offset=offset, limit=limit)
     
     async def update_entity_registry(self, entity_id: str, name: Optional[str] = None, 
                                    disabled_by: Optional[str] = None, area_id: Optional[str] = None) -> Dict[str, Any]:
@@ -726,7 +982,7 @@ class HomeAssistantClient:
         if area_id is not None:
             data["area_id"] = area_id
         
-        return await self._request("POST", f"/api/config/entity_registry/{entity_id}", json=data)
+        return await self._ws_send_command({"type": "config/entity_registry/update", "entity_id": entity_id, **data})
     
     async def enable_entity(self, entity_id: str) -> Dict[str, Any]:
         """Enable an entity"""
@@ -1293,6 +1549,28 @@ async def handle_list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="get_image_entity",
+            description="Get image from an image.* entity (returns base64 encoded image, auto-resized and compressed). Use this for image.* entities, NOT camera.* entities.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "image_entity_id": {
+                        "type": "string",
+                        "description": "Image entity ID (e.g., image.front_door_person)"
+                    },
+                    "max_size": {
+                        "type": "integer",
+                        "description": "Max dimension in pixels (default: 800). Image is resized keeping aspect ratio."
+                    },
+                    "quality": {
+                        "type": "integer",
+                        "description": "JPEG quality 1-95 (default: 60). Lower = smaller but blurrier."
+                    }
+                },
+                "required": ["image_entity_id"]
+            }
+        ),
+        Tool(
             name="call_service_with_response",
             description="Call a service that returns response data (like weather forecasts)",
             inputSchema={
@@ -1367,10 +1645,58 @@ async def handle_list_tools() -> List[Tool]:
         ),
         Tool(
             name="get_automations",
-            description="Get list of all automations",
+            description="Get list of all automations (uses lightweight registry, not /api/states). Use compact=true for a minimal inventory. Supports search, state filter, and pagination.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "compact": {
+                        "type": "boolean",
+                        "description": "If true, return only entity_id, friendly_name, unique_id, disabled_by (no full state). Much faster and smaller.",
+                        "default": False
+                    },
+                    "search": {
+                        "type": "string",
+                        "description": "Filter by entity_id or friendly_name (case-insensitive substring match)"
+                    },
+                    "state": {
+                        "type": "string",
+                        "description": "Filter by state value (e.g., 'on', 'off', 'disabled')"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip first N results (default 0)",
+                        "default": 0
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (0 = all, default 0)",
+                        "default": 0
+                    }
+                },
+                "required": []
+            }
+        ),
+        Tool(
+            name="get_automation_configs",
+            description="Get raw configs (triggers, conditions, actions) for all UI-managed automations. YAML-only automations are flagged. Supports search and pagination.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "search": {
+                        "type": "string",
+                        "description": "Filter configs by keyword (case-insensitive, searches all fields)"
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip first N results (default 0)",
+                        "default": 0
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (0 = all, default 0)",
+                        "default": 0
+                    }
+                },
                 "required": []
             }
         ),
@@ -1452,7 +1778,7 @@ async def handle_list_tools() -> List[Tool]:
                 "properties": {
                     "config": {
                         "type": "object",
-                        "description": "Automation configuration with alias, trigger, condition, and action",
+                        "description": "Automation configuration with alias, triggers, conditions, and actions (HA 2026.x plural format; singular forms are auto-normalized)",
                         "properties": {
                             "alias": {
                                 "type": "string",
@@ -1462,20 +1788,20 @@ async def handle_list_tools() -> List[Tool]:
                                 "type": "string",
                                 "description": "Description of what the automation does"
                             },
-                            "trigger": {
-                                "type": "object",
-                                "description": "Trigger configuration (e.g., time, state, event)"
+                            "triggers": {
+                                "type": "array",
+                                "description": "Trigger configurations (e.g., time, state, event)"
                             },
-                            "condition": {
-                                "type": "object",
-                                "description": "Condition configuration (optional)"
+                            "conditions": {
+                                "type": "array",
+                                "description": "Condition configurations (optional)"
                             },
-                            "action": {
-                                "type": "object",
-                                "description": "Action to perform when triggered"
+                            "actions": {
+                                "type": "array",
+                                "description": "Actions to perform when triggered"
                             }
                         },
-                        "required": ["alias", "trigger", "action"]
+                        "required": ["alias", "triggers", "actions"]
                     }
                 },
                 "required": ["config"]
@@ -1639,10 +1965,14 @@ async def handle_list_tools() -> List[Tool]:
         ),
         Tool(
             name="get_scenes",
-            description="Get list of all scenes",
+            description="Get list of all scenes. Supports search and pagination.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "search": {"type": "string", "description": "Filter by entity_id (case-insensitive)"},
+                    "offset": {"type": "integer", "description": "Skip first N results", "default": 0},
+                    "limit": {"type": "integer", "description": "Max results (0=all)", "default": 0}
+                },
                 "required": []
             }
         ),
@@ -1754,10 +2084,14 @@ async def handle_list_tools() -> List[Tool]:
         # Device Management Tools
         Tool(
             name="get_devices",
-            description="Get list of all devices in Home Assistant",
+            description="Get list of all devices. Supports search (name, manufacturer, model) and pagination.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "search": {"type": "string", "description": "Filter by name, manufacturer, or model"},
+                    "offset": {"type": "integer", "description": "Skip first N results", "default": 0},
+                    "limit": {"type": "integer", "description": "Max results (0=all)", "default": 0}
+                },
                 "required": []
             }
         ),
@@ -1803,14 +2137,15 @@ async def handle_list_tools() -> List[Tool]:
         ),
         Tool(
             name="get_entities_by_area",
-            description="Get all entities in a specific area",
+            description="Get all entities in a specific area. Supports search, domain filter, and pagination.",
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "area_id": {
-                        "type": "string",
-                        "description": "ID of the area to get entities for"
-                    }
+                    "area_id": {"type": "string", "description": "ID of the area to get entities for"},
+                    "search": {"type": "string", "description": "Filter by entity_id or name"},
+                    "domain": {"type": "string", "description": "Filter by domain (e.g., 'light', 'switch', 'sensor')"},
+                    "offset": {"type": "integer", "description": "Skip first N results", "default": 0},
+                    "limit": {"type": "integer", "description": "Max results (0=all)", "default": 0}
                 },
                 "required": ["area_id"]
             }
@@ -1873,10 +2208,15 @@ async def handle_list_tools() -> List[Tool]:
         # Integration Management Tools
         Tool(
             name="get_integrations",
-            description="Get list of all configured integrations",
+            description="Get list of all configured integrations. Supports search (title, domain), domain filter, and pagination.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "search": {"type": "string", "description": "Filter by title or domain"},
+                    "domain": {"type": "string", "description": "Filter by integration domain (e.g., 'hue', 'zwave')"},
+                    "offset": {"type": "integer", "description": "Skip first N results", "default": 0},
+                    "limit": {"type": "integer", "description": "Max results (0=all)", "default": 0}
+                },
                 "required": []
             }
         ),
@@ -2003,10 +2343,15 @@ async def handle_list_tools() -> List[Tool]:
         # Entity Registry Management Tools
         Tool(
             name="get_entity_registry",
-            description="Get entity registry information for all entities",
+            description="Get entity registry. Supports search (entity_id, name), domain filter, and pagination.",
             inputSchema={
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "search": {"type": "string", "description": "Filter by entity_id or name"},
+                    "domain": {"type": "string", "description": "Filter by domain (e.g., 'light', 'sensor', 'automation')"},
+                    "offset": {"type": "integer", "description": "Skip first N results", "default": 0},
+                    "limit": {"type": "integer", "description": "Max results (0=all)", "default": 0}
+                },
                 "required": []
             }
         ),
@@ -2325,8 +2670,46 @@ async def handle_list_tools() -> List[Tool]:
         )
     ]
 
+def _detect_mime_type(data: bytes) -> str:
+    """Detect image MIME type from magic bytes."""
+    if data[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if data[:2] == b'\xff\xd8':
+        return "image/jpeg"
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return "image/webp"
+    if data[:4] == b'GIF8':
+        return "image/gif"
+    return "image/png"  # safe default — Claude accepts PNG
+
+
+def _process_image(image_data: bytes, arguments: Dict[str, Any]) -> tuple:
+    """Resize/compress image and return (b64, mime_type, orig_size)."""
+    import base64
+    from io import BytesIO
+    try:
+        from PIL import Image
+        max_size = int(arguments.get("max_size", 800))
+        quality = int(arguments.get("quality", 60))
+        quality = max(1, min(95, quality))
+        img = Image.open(BytesIO(image_data))
+        orig_size = f"{img.width}x{img.height}"
+        img.thumbnail((max_size, max_size), Image.LANCZOS)
+        # Convert to RGB for JPEG (handles RGBA PNGs)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode('utf-8'), "image/jpeg", orig_size
+    except ImportError:
+        # No Pillow — send raw bytes with detected mime type
+        mime_type = _detect_mime_type(image_data)
+        b64 = base64.b64encode(image_data).decode('utf-8')
+        return b64, mime_type, "unknown"
+
+
 @server.call_tool()
-async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextContent]:
+async def handle_call_tool(name: str, arguments: Dict[str, Any]):
     """Handle tool calls"""
     if not HA_TOKEN:
         return [TextContent(
@@ -2445,33 +2828,23 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
                 from io import BytesIO
                 camera_entity_id = arguments["camera_entity_id"]
                 image_data = await client.get_camera_proxy(camera_entity_id)
-                try:
-                    from PIL import Image
-                    max_size = int(arguments.get("max_size", 800))
-                    quality = int(arguments.get("quality", 60))
-                    quality = max(1, min(95, quality))
-                    # Resize and compress to save tokens
-                    img = Image.open(BytesIO(image_data))
-                    orig_size = f"{img.width}x{img.height}"
-                    img.thumbnail((max_size, max_size), Image.LANCZOS)
-                    buf = BytesIO()
-                    img.save(buf, format="JPEG", quality=quality, optimize=True)
-                    compressed = buf.getvalue()
-                    result = {
-                        "image_base64": base64.b64encode(compressed).decode('utf-8'),
-                        "content_type": "image/jpeg",
-                        "original_size": orig_size,
-                        "resized_to": f"{img.width}x{img.height}",
-                        "bytes": len(compressed),
-                    }
-                except ImportError:
-                    result = {
-                        "image_base64": base64.b64encode(image_data).decode('utf-8'),
-                        "content_type": "image/jpeg",
-                        "warning": "Pillow not installed — raw image returned (install with: pip install Pillow)",
-                        "bytes": len(image_data),
-                    }
-                
+                b64, mime_type, orig_size = _process_image(image_data, arguments)
+                return [
+                    ImageContent(type="image", data=b64, mimeType=mime_type),
+                    TextContent(type="text", text=f"Camera image from {camera_entity_id} (original: {orig_size})"),
+                ]
+
+            elif name == "get_image_entity":
+                import base64
+                from io import BytesIO
+                image_entity_id = arguments["image_entity_id"]
+                image_data = await client.get_image_proxy(image_entity_id)
+                b64, mime_type, orig_size = _process_image(image_data, arguments)
+                return [
+                    ImageContent(type="image", data=b64, mimeType=mime_type),
+                    TextContent(type="text", text=f"Image from {image_entity_id} (original: {orig_size})"),
+                ]
+
             elif name == "call_service_with_response":
                 domain = arguments["domain"]
                 service = arguments["service"]
@@ -2509,8 +2882,21 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
                 result = sse_manager.get_stats()
                 
             elif name == "get_automations":
-                result = await client.get_automations()
-                
+                result = await client.get_automations(
+                    compact=arguments.get("compact", False),
+                    search=arguments.get("search"),
+                    state_filter=arguments.get("state"),
+                    offset=int(arguments.get("offset", 0)),
+                    limit=int(arguments.get("limit", 0)),
+                )
+
+            elif name == "get_automation_configs":
+                result = await client.get_automation_configs(
+                    search=arguments.get("search"),
+                    offset=int(arguments.get("offset", 0)),
+                    limit=int(arguments.get("limit", 0)),
+                )
+
             elif name == "get_automation":
                 automation_id = arguments["automation_id"]
                 result = await client.get_automation(automation_id)
@@ -2536,7 +2922,7 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
                 if isinstance(config, str):
                     config = json.loads(config)
                 result = await client.create_automation(config)
-                
+
             elif name == "update_automation":
                 automation_id = arguments["automation_id"]
                 config = arguments["config"]
@@ -2579,7 +2965,11 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
                 result = await client.reload_scripts()
 
             elif name == "get_scenes":
-                result = await client.get_scenes()
+                result = await client.get_scenes(
+                    search=arguments.get("search"),
+                    offset=int(arguments.get("offset", 0)),
+                    limit=int(arguments.get("limit", 0)),
+                )
                 
             elif name == "activate_scene":
                 scene_id = arguments["scene_id"]
@@ -2609,12 +2999,21 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
                 result = await client.delete_area(area_id)
                 
             elif name == "get_entities_by_area":
-                area_id = arguments["area_id"]
-                result = await client.get_entities_by_area(area_id)
+                result = await client.get_entities_by_area(
+                    area_id=arguments["area_id"],
+                    search=arguments.get("search"),
+                    domain=arguments.get("domain"),
+                    offset=int(arguments.get("offset", 0)),
+                    limit=int(arguments.get("limit", 0)),
+                )
                 
             # Device Management Tools
             elif name == "get_devices":
-                result = await client.get_devices()
+                result = await client.get_devices(
+                    search=arguments.get("search"),
+                    offset=int(arguments.get("offset", 0)),
+                    limit=int(arguments.get("limit", 0)),
+                )
                 
             elif name == "get_device":
                 device_id = arguments["device_id"]
@@ -2648,7 +3047,12 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
                 
             # Integration Management Tools
             elif name == "get_integrations":
-                result = await client.get_integrations()
+                result = await client.get_integrations(
+                    search=arguments.get("search"),
+                    domain=arguments.get("domain"),
+                    offset=int(arguments.get("offset", 0)),
+                    limit=int(arguments.get("limit", 0)),
+                )
                 
             elif name == "reload_integration":
                 integration_domain = arguments["integration_domain"]
@@ -2687,7 +3091,12 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]) -> List[TextCon
                 
             # Entity Registry Management Tools
             elif name == "get_entity_registry":
-                result = await client.get_entity_registry()
+                result = await client.get_entity_registry(
+                    search=arguments.get("search"),
+                    domain=arguments.get("domain"),
+                    offset=int(arguments.get("offset", 0)),
+                    limit=int(arguments.get("limit", 0)),
+                )
                 
             elif name == "update_entity_registry":
                 entity_id = arguments["entity_id"]
