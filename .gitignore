@@ -121,6 +121,3 @@ dmypy.json
 
 # Project specific
 homeassistant-mcp.log
-
-# Local launcher with personal credentials (do not commit)
-start_mcp.sh
