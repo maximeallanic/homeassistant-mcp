@@ -3248,5 +3248,10 @@ async def main():
             ),
         )
 
-if __name__ == "__main__":
+def cli() -> None:
+    """Synchronous entry point for console_scripts / uvx."""
     asyncio.run(main())
+
+
+if __name__ == "__main__":
+    cli()
