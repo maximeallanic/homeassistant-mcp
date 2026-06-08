@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import uuid
 import time
 from typing import Any, Dict, List, Optional, Union, Set
@@ -69,6 +70,66 @@ def _paginate(
     if limit > 0:
         items = items[:limit]
     return {"items": items, "total": total, "offset": offset, "limit": limit}
+
+
+_ENTITY_ID_RE = re.compile(r"^[a-z0-9_]+\.[a-z0-9_]+$")
+
+
+def _extract_entity_ids(node: Any) -> Set[str]:
+    """Collect entity_ids bound on cards (values of entity/entity_id/entities keys).
+
+    Used to reject a dashboard that references entities which do not exist — the
+    guard against an agent hallucinating cards for devices the user doesn't own.
+    Jinja templates (icon/secondary expressions) are NOT collected, only direct
+    bindings, and only strings shaped like `domain.object` survive.
+    """
+    found: Set[str] = set()
+
+    def add(v: Any) -> None:
+        if isinstance(v, str):
+            found.add(v)
+        elif isinstance(v, dict) and isinstance(v.get("entity"), str):
+            found.add(v["entity"])
+
+    def walk(n: Any) -> None:
+        if isinstance(n, dict):
+            for k, v in n.items():
+                if k in ("entity", "entity_id"):
+                    if isinstance(v, list):
+                        for x in v:
+                            add(x)
+                    else:
+                        add(v)
+                elif k == "entities" and isinstance(v, list):
+                    for x in v:
+                        add(x)
+                walk(v)
+        elif isinstance(n, list):
+            for x in n:
+                walk(x)
+
+    walk(node)
+    return {e for e in found if _ENTITY_ID_RE.match(e)}
+
+
+async def _snapshot_dashboard(client: "HomeAssistantClient", url_path: Optional[str]) -> str:
+    """Persist the CURRENT dashboard config before it is overwritten, for rollback.
+
+    There is no versioning on HA storage-mode dashboards: without this, an
+    accidental or hallucinated overwrite is irreversible. Returns the backup file
+    path (or an error marker)."""
+    try:
+        current = await client.get_dashboard_config(url_path)
+        backup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_backups")
+        os.makedirs(backup_dir, exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        safe = (url_path or "default").replace("/", "_")
+        path = os.path.join(backup_dir, f"{safe}-{ts}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(current, f, ensure_ascii=False, indent=2)
+        return path
+    except Exception as e:  # snapshot must never block a legitimate save
+        return f"(snapshot failed: {e})"
 
 
 class HomeAssistantClient:
@@ -3127,11 +3188,31 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
                 result = await client.get_dashboard_config(arguments.get("url_path"))
 
             elif name == "update_dashboard_config":
-                result = await client.save_dashboard_config(
-                    arguments["config"],
-                    arguments.get("url_path"),
-                    arguments.get("force", False)
+                _new_config = arguments["config"]
+                _url_path = arguments.get("url_path")
+                _force = arguments.get("force", False)
+                # Guard 1 — entity validation: never persist a card that references an
+                # entity which does not exist (hallucinated devices). force=true overrides.
+                try:
+                    _live_ids = {s.get("entity_id") for s in (await client.get_states())}
+                except Exception:
+                    _live_ids = None  # if states are unreachable, don't block the save
+                _unknown = sorted(
+                    e for e in _extract_entity_ids(_new_config)
+                    if _live_ids is not None and e not in _live_ids
                 )
+                if _unknown and not _force:
+                    result = {
+                        "error": "refused: dashboard references entities that do not exist in Home Assistant",
+                        "unknown_entities": _unknown,
+                        "hint": "These entity_ids were likely hallucinated. Fix them, or pass force=true to override.",
+                    }
+                else:
+                    # Guard 2 — snapshot the current config before overwriting (rollback).
+                    _backup = await _snapshot_dashboard(client, _url_path)
+                    result = await client.save_dashboard_config(_new_config, _url_path, _force)
+                    result = {"result": result, "_backup": _backup,
+                              **({"_forced_unknown_entities": _unknown} if _unknown else {})}
 
             elif name == "create_dashboard":
                 result = await client.create_dashboard(
