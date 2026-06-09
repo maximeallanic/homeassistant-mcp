@@ -132,6 +132,61 @@ async def _snapshot_dashboard(client: "HomeAssistantClient", url_path: Optional[
         return f"(snapshot failed: {e})"
 
 
+def _data_tmp_dir() -> str:
+    """The daemon's data/tmp (server.py lives at data/mcp-servers/homeassistant-mcp/)."""
+    d = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "tmp"))
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _materialize_dashboard(config: Any, url_path: Optional[str]) -> Dict[str, Any]:
+    """Write the LIVE config to a DETERMINISTIC file (one per dashboard, overwritten each
+    call) and return a short summary instead of the full JSON. Avoids the tool-result
+    truncation on big Lovelace configs and removes the live/backup confusion: there is
+    exactly one 'current' file per dashboard, always the latest get."""
+    import hashlib
+    safe = (url_path or "default").replace("/", "_")
+    path = os.path.join(_data_tmp_dir(), f"dash-live-{safe}.json")
+    text = json.dumps(config, indent=2, ensure_ascii=False)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    n_cards = 0
+    try:
+        for v in (config.get("views", []) if isinstance(config, dict) else []):
+            n_cards += len(v.get("cards", []) or [])
+    except Exception:
+        pass
+    return {
+        "path": path,
+        "size_bytes": len(text.encode("utf-8")),
+        "n_cards": n_cards,
+        "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()[:16],
+        "url_path": url_path or "default",
+        "note": "LIVE config written to this deterministic file (overwritten on each get). "
+                "Edit THIS file, then call update_dashboard_config_from_file. "
+                "NEVER edit a dashboard_backups/* file or a tool-result-*.txt — they are stale snapshots.",
+    }
+
+
+async def _save_dashboard_guarded(client: "HomeAssistantClient", config: Any, url_path: Optional[str], force: bool) -> Dict[str, Any]:
+    """Entity guard (reject hallucinated entities unless force) + rollback backup + save.
+    Shared by update_dashboard_config and update_dashboard_config_from_file."""
+    try:
+        live_ids = {s.get("entity_id") for s in (await client.get_states())}
+    except Exception:
+        live_ids = None  # states unreachable → don't block the save
+    unknown = sorted(e for e in _extract_entity_ids(config) if live_ids is not None and e not in live_ids)
+    if unknown and not force:
+        return {
+            "error": "refused: dashboard references entities that do not exist in Home Assistant",
+            "unknown_entities": unknown,
+            "hint": "These entity_ids were likely hallucinated. Fix them, or pass force=true to override.",
+        }
+    backup = await _snapshot_dashboard(client, url_path)
+    res = await client.save_dashboard_config(config, url_path, force)
+    return {"result": res, "_backup": backup, **({"_forced_unknown_entities": unknown} if unknown else {})}
+
+
 class HomeAssistantClient:
     """Home Assistant API client with REST and WebSocket support"""
 
@@ -2511,7 +2566,7 @@ async def handle_list_tools() -> List[Tool]:
         ),
         Tool(
             name="get_dashboard_config",
-            description="Get the full configuration of a Lovelace dashboard",
+            description="Fetch a Lovelace dashboard's LIVE config and write it to a deterministic file (data/tmp/dash-live-<url>.json, overwritten each call). Returns {path,size_bytes,n_cards,sha256} — NOT the full JSON (avoids truncation). Read/edit that file, then save with update_dashboard_config_from_file.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2521,7 +2576,7 @@ async def handle_list_tools() -> List[Tool]:
         ),
         Tool(
             name="update_dashboard_config",
-            description="Save/update a Lovelace dashboard configuration",
+            description="Save/update a Lovelace dashboard configuration (full config object inline). For big configs prefer update_dashboard_config_from_file to avoid truncation.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -2530,6 +2585,19 @@ async def handle_list_tools() -> List[Tool]:
                     "force": {"type": "boolean", "description": "Force save even if config was edited in UI"}
                 },
                 "required": ["config"]
+            }
+        ),
+        Tool(
+            name="update_dashboard_config_from_file",
+            description="Save a Lovelace dashboard from a JSON FILE on disk — use the path returned by get_dashboard_config (data/tmp/dash-live-<url>.json) after editing it. Avoids passing the full config inline (no truncation). Same entity guard + rollback backup as update_dashboard_config.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "Path to the JSON file with the full dashboard config (e.g. the dash-live-<url>.json from get_dashboard_config)"},
+                    "url_path": {"type": "string", "description": "Dashboard URL path (omit for default)"},
+                    "force": {"type": "boolean", "description": "Force save even if it references unknown entities / was edited in UI"}
+                },
+                "required": ["file_path"]
             }
         ),
         Tool(
@@ -3332,34 +3400,30 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
                     result = {"error": str(e), "hint": "Try websocket_call with type='lovelace/dashboards'"}
 
             elif name == "get_dashboard_config":
-                result = await client.get_dashboard_config(arguments.get("url_path"))
+                # Materialize the LIVE config to a deterministic file and return a short
+                # summary (path/size/n_cards/sha) — NOT the full JSON. Big Lovelace configs
+                # otherwise overflow the tool-result limit and get truncated, and the agent
+                # then juggles stale snapshots/backups. Edit the file, then save via
+                # update_dashboard_config_from_file.
+                _cfg = await client.get_dashboard_config(arguments.get("url_path"))
+                result = _materialize_dashboard(_cfg, arguments.get("url_path"))
 
             elif name == "update_dashboard_config":
-                _new_config = arguments["config"]
-                _url_path = arguments.get("url_path")
-                _force = arguments.get("force", False)
-                # Guard 1 — entity validation: never persist a card that references an
-                # entity which does not exist (hallucinated devices). force=true overrides.
+                result = await _save_dashboard_guarded(
+                    client, arguments["config"], arguments.get("url_path"), arguments.get("force", False))
+
+            elif name == "update_dashboard_config_from_file":
+                _fp = arguments["file_path"]
                 try:
-                    _live_ids = {s.get("entity_id") for s in (await client.get_states())}
-                except Exception:
-                    _live_ids = None  # if states are unreachable, don't block the save
-                _unknown = sorted(
-                    e for e in _extract_entity_ids(_new_config)
-                    if _live_ids is not None and e not in _live_ids
-                )
-                if _unknown and not _force:
-                    result = {
-                        "error": "refused: dashboard references entities that do not exist in Home Assistant",
-                        "unknown_entities": _unknown,
-                        "hint": "These entity_ids were likely hallucinated. Fix them, or pass force=true to override.",
-                    }
+                    with open(_fp, "r", encoding="utf-8") as _f:
+                        _cfg = json.load(_f)
+                except Exception as _e:
+                    result = {"error": f"could not read/parse file: {_e}", "file_path": _fp}
                 else:
-                    # Guard 2 — snapshot the current config before overwriting (rollback).
-                    _backup = await _snapshot_dashboard(client, _url_path)
-                    result = await client.save_dashboard_config(_new_config, _url_path, _force)
-                    result = {"result": result, "_backup": _backup,
-                              **({"_forced_unknown_entities": _unknown} if _unknown else {})}
+                    result = await _save_dashboard_guarded(
+                        client, _cfg, arguments.get("url_path"), arguments.get("force", False))
+                    if isinstance(result, dict):
+                        result["from_file"] = _fp
 
             elif name == "create_dashboard":
                 result = await client.create_dashboard(
