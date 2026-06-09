@@ -1632,6 +1632,28 @@ async def handle_list_tools() -> List[Tool]:
             }
         ),
         Tool(
+            name="measure_dashboard_layout",
+            description="Objectively MEASURE the geometry of a tablet dashboard screenshot (image.* entity) and return CHIFFRES: left/right margins in px, horizontal asymmetry, edge clipping (right/left/bottom), symmetric=true/false. Use this to VERIFY layout (margins, centering, a card cut off) instead of judging by eye — the verdict is measured, not estimated. Optionally refreshes the tablet first (reloads the dashboard) and can compare against a reference dashboard known to be correct.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "image_entity_id": {
+                        "type": "string",
+                        "description": "Image entity of the tablet to measure (e.g., image.tablette_bureau_capture_d_ecran)"
+                    },
+                    "refresh": {
+                        "type": "boolean",
+                        "description": "If true (default), wake the screen + press the tablet's load_start_url button + update_entity to get a fresh frame before measuring."
+                    },
+                    "reference_entity_id": {
+                        "type": "string",
+                        "description": "Optional image entity of a dashboard known to be correct (e.g., the cuisine/salon tablet) — its measurements are returned under 'reference' for comparison."
+                    }
+                },
+                "required": ["image_entity_id"]
+            }
+        ),
+        Tool(
             name="call_service_with_response",
             description="Call a service that returns response data (like weather forecasts)",
             inputSchema={
@@ -2781,6 +2803,59 @@ def _process_image(image_data: bytes, arguments: Dict[str, Any]) -> tuple:
         return b64, mime_type, "unknown"
 
 
+def _measure_layout(image_bytes: bytes, n_rows: int = 9, sym_threshold: int = 8) -> Dict[str, Any]:
+    """Objectively measure a dashboard screenshot's geometry from pixels (no judgement).
+
+    Returns chiffres (left/right margins per row, asymmetry, edge clipping) so a caller
+    relies on MEASURED numbers instead of eyeballing a low-res capture. Background colour
+    is sampled from the top-left corner; a "card" pixel is one clearly darker than the
+    background (works for the teal-on-pale tablet dashboards). Measured on the NATIVE
+    bytes (no downscale) so the px values are at full resolution.
+    """
+    from PIL import Image
+    from io import BytesIO
+    import statistics
+    im = Image.open(BytesIO(image_bytes)).convert("RGB")
+    W, H = im.size
+    px = im.load()
+    bg = px[3, 3]
+    bg_sum = sum(bg)
+    def is_card(c):  # clearly darker than background
+        return sum(c) < bg_sum - 90
+    rows = []
+    for k in range(1, n_rows + 1):
+        y = int(H * k / (n_rows + 1))
+        xs = [x for x in range(W) if is_card(px[x, y])]
+        if len(xs) < 5:
+            continue
+        left, right = xs[0], W - 1 - xs[-1]
+        rows.append({"y": y, "left": left, "right": right, "delta": left - right})
+    if not rows:
+        return {"error": "no cards detected (background/threshold mismatch — image may be blank, a screensaver, or an unexpected theme)",
+                "width": W, "height": H}
+    med_left = round(statistics.median(r["left"] for r in rows))
+    med_right = round(statistics.median(r["right"] for r in rows))
+    med_delta = round(statistics.median(r["delta"] for r in rows))
+    # bottom-clip: scan columns; content touching the bottom edge = a card cut off below
+    cols_bottom = 0
+    for k in range(1, 10):
+        x = int(W * k / 10)
+        ys = [y for y in range(H) if is_card(px[x, y])]
+        if ys and (H - 1 - ys[-1]) <= 2:
+            cols_bottom += 1
+    return {
+        "width": W, "height": H,
+        "left_margin_px": med_left,
+        "right_margin_px": med_right,
+        "h_asymmetry_px": med_delta,            # left - right; >0 = pushed right, <0 = pushed left
+        "symmetric": abs(med_delta) <= sym_threshold,
+        "right_clip": med_right <= 3,           # cards touching the right edge
+        "left_clip": med_left <= 3,
+        "bottom_clip": cols_bottom >= 2,        # cards cut off at the bottom edge
+        "rows": rows,
+    }
+
+
 @server.call_tool()
 async def handle_call_tool(name: str, arguments: Dict[str, Any]):
     """Handle tool calls"""
@@ -2927,6 +3002,55 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
                 return [
                     ImageContent(type="image", data=b64, mimeType=mime_type),
                     TextContent(type="text", text=f"Image from {image_entity_id} (original: {orig_size}){freshness}"),
+                ]
+
+            elif name == "measure_dashboard_layout":
+                import asyncio as _asyncio
+                image_entity_id = arguments["image_entity_id"]
+                refresh = arguments.get("refresh", True)
+                reference_entity_id = arguments.get("reference_entity_id")
+
+                async def _capture_and_measure(ent):
+                    # Optional fresh capture via the NATIVE Fully Kiosk reload button
+                    # (load_start_url) + update_entity — the validated runbook.
+                    if refresh:
+                        m = re.search(r"image\.(?:tablette_)?(.+?)_capture", ent)
+                        slug = m.group(1) if m else None
+                        if slug:
+                            try:
+                                await client.call_service("switch", "turn_on", {"entity_id": f"switch.tablette_{slug}_screen"})
+                                await client.call_service("button", "press", {"entity_id": f"button.tablette_{slug}_load_start_url"})
+                            except Exception:
+                                pass
+                            await _asyncio.sleep(18)
+                            try:
+                                await client.call_service("homeassistant", "update_entity", {"entity_id": ent})
+                            except Exception:
+                                pass
+                            await _asyncio.sleep(3)
+                    raw_bytes = await client.get_image_proxy(ent)
+                    meas = _measure_layout(raw_bytes)
+                    try:
+                        st = await client.get_state(ent)
+                        meas["frame_timestamp"] = st.get("state")
+                    except Exception:
+                        meas["frame_timestamp"] = None
+                    return raw_bytes, meas
+
+                raw, measurements = await _capture_and_measure(image_entity_id)
+                if reference_entity_id:
+                    try:
+                        _ref_raw, ref_meas = await _capture_and_measure(reference_entity_id)
+                        measurements["reference"] = {"entity_id": reference_entity_id, **{
+                            k: ref_meas[k] for k in ("left_margin_px", "right_margin_px", "h_asymmetry_px", "symmetric", "right_clip", "bottom_clip", "frame_timestamp")
+                            if k in ref_meas
+                        }}
+                    except Exception as e:
+                        measurements["reference"] = {"error": str(e)}
+                b64, mime_type, _orig = _process_image(raw, arguments)
+                return [
+                    ImageContent(type="image", data=b64, mimeType=mime_type),
+                    TextContent(type="text", text=json.dumps({"entity_id": image_entity_id, **measurements}, indent=2, ensure_ascii=False)),
                 ]
 
             elif name == "call_service_with_response":
