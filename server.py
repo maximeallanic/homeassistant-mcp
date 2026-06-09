@@ -116,8 +116,8 @@ async def _snapshot_dashboard(client: "HomeAssistantClient", url_path: Optional[
     """Persist the CURRENT dashboard config before it is overwritten, for rollback.
 
     There is no versioning on HA storage-mode dashboards: without this, an
-    accidental or hallucinated overwrite is irreversible. Returns the backup file
-    path (or an error marker)."""
+    accidental or hallucinated overwrite is irreversible (as happened to the
+    kitchen tablet). Returns the backup file path (or an error marker)."""
     try:
         current = await client.get_dashboard_config(url_path)
         backup_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard_backups")
@@ -2745,7 +2745,18 @@ def _detect_mime_type(data: bytes) -> str:
 
 
 def _process_image(image_data: bytes, arguments: Dict[str, Any]) -> tuple:
-    """Resize/compress image and return (b64, mime_type, orig_size)."""
+    """Resize/compress image and return (b64, mime_type, orig_size).
+
+    The returned mime_type is ALWAYS sniffed from the magic bytes of the
+    bytes we actually emit — never a declared/assumed label. Home Assistant's
+    image_proxy can mislabel a PNG as image/jpeg; emitting a block whose
+    media_type disagrees with its bytes makes the Anthropic vision API reject
+    it with a 400, and because the block is persisted into the session it
+    re-400s on every subsequent turn (~5s crash loop, session poisoned). The
+    Pillow path always re-encodes to JPEG so the bytes/mime are coherent, but
+    deriving the label from the emitted bytes keeps the invariant true even if
+    the encoding ever changes.
+    """
     import base64
     from io import BytesIO
     try:
@@ -2761,7 +2772,8 @@ def _process_image(image_data: bytes, arguments: Dict[str, Any]) -> tuple:
             img = img.convert("RGB")
         buf = BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True)
-        return base64.b64encode(buf.getvalue()).decode('utf-8'), "image/jpeg", orig_size
+        encoded = buf.getvalue()
+        return base64.b64encode(encoded).decode('utf-8'), _detect_mime_type(encoded), orig_size
     except ImportError:
         # No Pillow — send raw bytes with detected mime type
         mime_type = _detect_mime_type(image_data)
@@ -2901,9 +2913,20 @@ async def handle_call_tool(name: str, arguments: Dict[str, Any]):
                 image_entity_id = arguments["image_entity_id"]
                 image_data = await client.get_image_proxy(image_entity_id)
                 b64, mime_type, orig_size = _process_image(image_data, arguments)
+                # Freshness info: a stale capture (e.g. Fully Kiosk screenshot not yet
+                # refreshed after a reload) must be visible to the caller, otherwise
+                # verification happens against an outdated image.
+                freshness = ""
+                try:
+                    state = await client.get_state(image_entity_id)
+                    last_updated = state.get("last_updated") or state.get("last_changed")
+                    if last_updated:
+                        freshness = f" — captured at {last_updated} (WARNING: verify this timestamp is AFTER your last action before trusting this capture)"
+                except Exception:
+                    pass
                 return [
                     ImageContent(type="image", data=b64, mimeType=mime_type),
-                    TextContent(type="text", text=f"Image from {image_entity_id} (original: {orig_size})"),
+                    TextContent(type="text", text=f"Image from {image_entity_id} (original: {orig_size}){freshness}"),
                 ]
 
             elif name == "call_service_with_response":
